@@ -1427,6 +1427,60 @@ static PetscErrorCode DMView_VTK_pforest(PetscObject odm, PetscViewer viewer)
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
+  #define DMView_BINARY_P4EST_pforest _append_pforest(DMView_BINARY_P4EST)
+static PetscErrorCode DMView_BINARY_P4EST_pforest(DM dm, PetscViewer viewer)
+{
+  DM_Forest           *forest  = (DM_Forest *)dm->data;
+  DM_Forest_pforest   *pforest = (DM_Forest_pforest *)forest->data;
+  const char          *filename;
+  char                conn_filename[PETSC_MAX_PATH_LEN];
+  PetscBool           isbinary, isvalid_p4est;
+  PetscViewerFormat   format;
+  MPI_Comm comm = PetscObjectComm((PetscObject)dm); 
+
+  PetscFunctionBegin;
+
+  // Check the viewer type - should be PETSCVIEWERBINARY
+  PetscCall(PetscObjectTypeCompare((PetscObject)viewer, PETSCVIEWERBINARY, &isbinary));
+  PetscCheck(isbinary, comm, PETSC_ERR_ARG_WRONG, "Must use PETSCVIEWERBINARY to save DMForest in this format");
+
+  // Check the viewer format type - should be PETSC_VIEWER_BINARY_P4EST
+  PetscCall(PetscViewerGetFormat(viewer, &format));
+  PetscCheck(format == PETSC_VIEWER_BINARY_P4EST, comm, PETSC_ERR_ARG_WRONG, "The viewer format must be PETSC_VIEWER_BINARY_P4EST. Use the option -dm_view_format binary_p4est.");
+
+  // Not sure what this does but Iḿ following the structure of other viwer functions
+  PetscValidHeaderSpecific(dm, DM_CLASSID, 1);
+  PetscValidHeaderSpecific(viewer, PETSC_VIEWER_CLASSID, 2);
+
+  // Ensure the DM is fully set up before saving 
+  PetscCall(DMSetUp(dm));
+  PetscCheck(pforest->forest, PetscObjectComm((PetscObject)dm), PETSC_ERR_ARG_WRONGSTATE, "DM forest is not defined. cannot save.");
+  PetscCheck(pforest->topo && pforest->topo->conn, PetscObjectComm((PetscObject)dm), PETSC_ERR_ARG_WRONGSTATE, "DM topology/connectivity is missing; cannot save.");
+
+  // Verify integrity of the pest object
+  PetscCallP4estReturn(isvalid_p4est, p4est_is_valid, (pforest->forest));
+  PetscCheck(isvalid_p4est, comm, PETSC_ERR_LIB, "The p4est forest object is not valid!");
+
+  // Get filename
+  PetscCall(PetscViewerFileGetName(viewer, &filename));
+
+  // Save connectivity to <filename>.conn
+  PetscCall(PetscSNPrintf(conn_filename, sizeof(conn_filename), "%s.conn", filename));
+
+  // Extended save function to create an MPI-rank-independent file.
+  // * save_data = false because PETSc manages data in separate Vec objects.
+  // * save_partition = false to allow loading with a different number of processes 
+  #if !defined(P4_TO_P8)
+  PetscCallP4est(p4est_connectivity_save, (conn_filename, pforest->topo->conn));
+  PetscCallP4est(p4est_save_ext, (filename, pforest->forest, 0 /* save_data */, 0 /* save_partition */));
+  #else
+  PetscCallP4est(p8est_connectivity_save, (conn_filename, pforest->topo->conn));
+  PetscCallP4est(p8est_save_ext, (filename, pforest->forest, 0 /* save_data */, 0 /* save_partition */));
+  #endif
+
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
   #define DMView_HDF5_pforest _append_pforest(DMView_HDF5)
 static PetscErrorCode DMView_HDF5_pforest(DM dm, PetscViewer viewer)
 {
@@ -1454,7 +1508,7 @@ static PetscErrorCode DMView_GLVis_pforest(DM dm, PetscViewer viewer)
   #define DMView_pforest _append_pforest(DMView)
 static PetscErrorCode DMView_pforest(DM dm, PetscViewer viewer)
 {
-  PetscBool isascii, isvtk, ishdf5, isglvis;
+  PetscBool isascii, isvtk, ishdf5, isglvis, isbinary;
 
   PetscFunctionBegin;
   PetscValidHeaderSpecific(dm, DM_CLASSID, 1);
@@ -1463,6 +1517,7 @@ static PetscErrorCode DMView_pforest(DM dm, PetscViewer viewer)
   PetscCall(PetscObjectTypeCompare((PetscObject)viewer, PETSCVIEWERVTK, &isvtk));
   PetscCall(PetscObjectTypeCompare((PetscObject)viewer, PETSCVIEWERHDF5, &ishdf5));
   PetscCall(PetscObjectTypeCompare((PetscObject)viewer, PETSCVIEWERGLVIS, &isglvis));
+  PetscCall(PetscObjectTypeCompare((PetscObject)viewer, PETSCVIEWERBINARY, &isbinary));
   if (isascii) {
     PetscCall(DMView_ASCII_pforest((PetscObject)dm, viewer));
   } else if (isvtk) {
@@ -1471,7 +1526,9 @@ static PetscErrorCode DMView_pforest(DM dm, PetscViewer viewer)
     PetscCall(DMView_HDF5_pforest(dm, viewer));
   } else if (isglvis) {
     PetscCall(DMView_GLVis_pforest(dm, viewer));
-  } else SETERRQ(PetscObjectComm((PetscObject)dm), PETSC_ERR_SUP, "Viewer not supported (not VTK, HDF5, or GLVis)");
+  } else if (isbinary) {
+    PetscCall(DMView_BINARY_P4EST_pforest(dm, viewer));
+  } else SETERRQ(PetscObjectComm((PetscObject)dm), PETSC_ERR_SUP, "Viewer not supported (not VTK, HDF5, GLVis or BINARY)");
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
