@@ -4879,6 +4879,104 @@ static PetscErrorCode VecView_pforest_Native(Vec vec, PetscViewer viewer)
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
+#define DMLoad_pforest _append_pforest(DMLoad)
+static PetscErrorCode DMLoad_pforest(DM dm, PetscViewer viewer)
+{
+  DM_Forest           *forest = (DM_Forest *)dm->data;
+  DM_Forest_pforest   *pforest = (DM_Forest_pforest *)forest->data;
+  PetscBool           isbinary;
+  PetscViewerFormat   format;
+  const char          *filename;
+  char                conn_filename[PETSC_MAX_PATH_LEN];
+  MPI_Comm            comm = PetscObjectComm((PetscObject)dm);
+
+  PetscFunctionBegin;
+  // Check the viewer type -> should be PETSCVIEWERBINARY
+  PetscCall(PetscObjectTypeCompare((PetscObject)viewer, PETSCVIEWERBINARY, &isbinary));
+  PetscCheck(isbinary, comm, PETSC_ERR_ARG_WRONG, "Must use PETSCVIEWERBINARY to load DMForest");
+  
+  // Check the viewer type -> should be PETSC_VIEWER_BINARY_P4EST
+  PetscCall(PetscViewerGetFormat(viewer, &format));
+  PetscCheck(format == PETSC_VIEWER_BINARY_P4EST, comm, PETSC_ERR_ARG_WRONG, "The input file is not in the p4est native format. Use the viewer option '-dm_load_format binary_p4est'.");
+
+  // Clean up any existing data structures by member order of DM_Forest_pforest
+  PetscCall(DMFTopologyDestroy_pforest(&pforest->topo)); 
+  if (pforest->forest) PetscCallP4est(p4est_destroy, (pforest->forest));
+  pforest->forest = NULL;
+  if (pforest->ghost) PetscCallP4est(p4est_ghost_destroy, (pforest->ghost));
+  pforest->ghost = NULL;
+  if (pforest->lnodes) PetscCallP4est(p4est_lnodes_destroy, (pforest->lnodes));
+  pforest->lnodes = NULL;
+  //pforest->partition_for_coarsening;
+  //pforest->coarsen_hierarchy;
+  pforest->labelsFinalized = PETSC_FALSE;;
+  //pforest->adaptivitySuccess;
+  //pforest->cLocalStart;
+  //pforest->cLocalEnd;
+  PetscCall(DMDestroy(&pforest->plex));
+  PetscCall(PetscFree(pforest->ghostName));
+  PetscCall(PetscSFDestroy(&pforest->pointAdaptToSelfSF));
+  PetscCall(PetscSFDestroy(&pforest->pointSelfToAdaptSF));
+  PetscCall(PetscFree(pforest->pointAdaptToSelfCids));
+  PetscCall(PetscFree(pforest->pointSelfToAdaptCids));
+  
+  // Mark dm as not finished
+  dm->setupcalled = PETSC_FALSE; // signal that dm is not finished
+
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD, "BANANA\n"));
+  // Get the file Paths for loading
+  PetscCall(PetscViewerFileGetName(viewer, &filename));
+
+  // Load connectivity from <filename>.conn and build DMFTopology_pforest
+  PetscCall(PetscSNPrintf(conn_filename, sizeof(conn_filename), "%s.conn", filename));
+  {
+    PetscBool is_valid;
+    DMFTopology_pforest *topo;
+    PetscCall(PetscNew(&topo));
+    topo->refct = 1;
+    PetscCallP4estReturn(topo->conn, p4est_connectivity_load, (conn_filename, NULL));
+    PetscCallP4estReturn(is_valid, p4est_connectivity_is_valid, (topo->conn));
+    PetscCheck(is_valid, comm, PETSC_ERR_LIB, "The loaded p4est connectivity is not valid!");
+    PetscCallP4estReturn(topo->geom, p4est_geometry_new_connectivity, (topo->conn));
+    PetscCall(PforestConnectivityEnumerateFacets(topo->conn, &topo->tree_face_to_uniq));
+    pforest->topo = topo;
+  }
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD, "KIWI\n"));
+  // Load the forest object
+  // * data_size = 0 (no user data to load)
+  // * autopartition = 1 -> re-partition the mesh for the current number of MPI ranks
+  {
+    PetscBool is_valid;
+    PetscCallP4estReturn(pforest->forest, p4est_load_ext, (filename, comm, 0, 0, 1, 1, (void *)dm, &(pforest->topo->conn)));
+    PetscCallP4estReturn(is_valid, p4est_is_valid, (pforest->forest));
+    PetscCheck(is_valid, comm, PETSC_ERR_LIB, "The loaded p4est forest is not valid!");
+    pforest->forest->user_pointer = (void *)dm;
+  }
+
+  // Re-create ghost layers based on the DM's overlap setting
+  {
+    PetscInt    overlap;
+    PetscMPIInt size;
+
+    PetscCallMPI(MPI_Comm_size(comm, &size));
+    PetscCall(DMForestGetPartitionOverlap(dm, &overlap));
+    if (overlap > 0 && size > 1) {
+      PetscInt i;
+      PetscCallP4estReturn(pforest->ghost, p4est_ghost_new, (pforest->forest, P4EST_CONNECT_FULL));
+      PetscCallP4estReturn(pforest->lnodes, p4est_lnodes_new, (pforest->forest, pforest->ghost, -P4EST_DIM));
+      PetscCallP4est(p4est_ghost_support_lnodes, (pforest->forest, pforest->lnodes, pforest->ghost));
+      for (i = 1; i < overlap; i++) PetscCallP4est(p4est_ghost_expand_by_lnodes, (pforest->forest, pforest->lnodes, pforest->ghost));
+    }
+  }
+
+  // Mark DM as finished
+  dm->setupcalled = PETSC_TRUE;
+
+  PetscCall(DMPforestGetPlex(dm, NULL));
+
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
   #define VecLoad_pforest _append_pforest(VecLoad)
 static PetscErrorCode VecLoad_pforest(Vec vec, PetscViewer viewer)
 {
