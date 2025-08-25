@@ -1427,13 +1427,40 @@ static PetscErrorCode DMView_VTK_pforest(PetscObject odm, PetscViewer viewer)
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
+// Appends the contents of a source file (native .p4est) to a target file (binary .p4est started with PETSc header written by DMView)
+static PetscErrorCode AppendBinaryFile(const char *target_filename, const char *source_filename, MPI_Comm comm)
+{
+    FILE      *target_file, *source_file;
+    char      buffer[8192];
+    size_t    bytes_read;
+    PetscMPIInt rank;
+
+    PetscFunctionBegin;
+    PetscCallMPI(MPI_Comm_rank(comm, &rank));
+    if (rank == 0) {
+        target_file = fopen(target_filename, "ab"); /* 'a' for append, 'b' for binary */
+        PetscCheck(target_file, PETSC_COMM_SELF, PETSC_ERR_FILE_OPEN, "Could not open target file for appending: %s", target_filename);
+        source_file = fopen(source_filename, "rb"); /* 'r' for read, 'b' for binary */
+        PetscCheck(source_file, PETSC_COMM_SELF, PETSC_ERR_FILE_OPEN, "Could not open source temp file: %s", source_filename);
+
+        while ((bytes_read = fread(buffer, 1, sizeof(buffer), source_file)) > 0) {
+            fwrite(buffer, 1, bytes_read, target_file);
+        }
+        fclose(source_file);
+        fclose(target_file);
+        remove(source_filename); // remove temporary file in our context
+    }
+    PetscCallMPI(MPI_Barrier(comm));
+    PetscFunctionReturn(PETSC_SUCCESS);
+}
+
   #define DMView_BINARY_P4EST_pforest _append_pforest(DMView_BINARY_P4EST)
 static PetscErrorCode DMView_BINARY_P4EST_pforest(DM dm, PetscViewer viewer)
 {
   DM_Forest           *forest  = (DM_Forest *)dm->data;
   DM_Forest_pforest   *pforest = (DM_Forest_pforest *)forest->data;
   const char          *filename;
-  char                conn_filename[PETSC_MAX_PATH_LEN];
+  char                temp_filename[PETSC_MAX_PATH_LEN];
   PetscBool           isbinary, isvalid_p4est;
   PetscViewerFormat   format;
   MPI_Comm comm = PetscObjectComm((PetscObject)dm); 
@@ -1448,7 +1475,7 @@ static PetscErrorCode DMView_BINARY_P4EST_pforest(DM dm, PetscViewer viewer)
   PetscCall(PetscViewerGetFormat(viewer, &format));
   PetscCheck(format == PETSC_VIEWER_BINARY_P4EST, comm, PETSC_ERR_ARG_WRONG, "The viewer format must be PETSC_VIEWER_BINARY_P4EST. Use the option -dm_view_format binary_p4est.");
 
-  // Not sure what this does but Iḿ following the structure of other viwer functions
+  // Not sure what this does but Iḿ following the structure of other viewer routines
   PetscValidHeaderSpecific(dm, DM_CLASSID, 1);
   PetscValidHeaderSpecific(viewer, PETSC_VIEWER_CLASSID, 2);
 
@@ -1464,19 +1491,27 @@ static PetscErrorCode DMView_BINARY_P4EST_pforest(DM dm, PetscViewer viewer)
   // Get filename
   PetscCall(PetscViewerFileGetName(viewer, &filename));
 
-  // Save connectivity to <filename>.conn
-  PetscCall(PetscSNPrintf(conn_filename, sizeof(conn_filename), "%s.conn", filename));
+  // Create a temporary file name
+  PetscCall(PetscSNPrintf(temp_filename, sizeof(temp_filename), "%s.p4est_tmp", filename));
 
   // Extended save function to create an MPI-rank-independent file.
   // * save_data = false because PETSc manages data in separate Vec objects.
   // * save_partition = false to allow loading with a different number of processes 
+  // #if !defined(P4_TO_P8)
+  // PetscCallP4est(p4est_save_ext, (filename, pforest->forest, 0 /* save_data */, 0 /* save_partition */));
+  // #else
+  // PetscCallP4est(p8est_save_ext, (filename, pforest->forest, 0 /* save_data */, 0 /* save_partition */));
+  // #endif
+  
+  // Workaround for saving p4est onto a temporary file
   #if !defined(P4_TO_P8)
-  PetscCallP4est(p4est_connectivity_save, (conn_filename, pforest->topo->conn));
-  PetscCallP4est(p4est_save_ext, (filename, pforest->forest, 0 /* save_data */, 0 /* save_partition */));
+  PetscCallP4est(p4est_save_ext, (temp_filename, pforest->forest, 0 /* save_data */, 0 /* save_partition */));
   #else
-  PetscCallP4est(p8est_connectivity_save, (conn_filename, pforest->topo->conn));
-  PetscCallP4est(p8est_save_ext, (filename, pforest->forest, 0 /* save_data */, 0 /* save_partition */));
+  PetscCallP4est(p8est_save_ext, (temp_filename, pforest->forest, 0 /* save_data */, 0 /* save_partition */));
   #endif
+
+  // Append the contents of the temporary file to the target file and delete the temporary file
+  PetscCall(AppendBinaryFile(filename, temp_filename, comm));
 
   PetscFunctionReturn(PETSC_SUCCESS);
 }
@@ -4879,6 +4914,39 @@ static PetscErrorCode VecView_pforest_Native(Vec vec, PetscViewer viewer)
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
+// 
+static PetscErrorCode CreateFileWithoutHeader(const char *target_filename, const char *source_filename, long offset, MPI_Comm comm)
+{
+    FILE      *target_file, *source_file;
+    char      buffer[8192];
+    size_t    bytes_read;
+    PetscMPIInt rank;
+
+    PetscFunctionBegin;
+    PetscCallMPI(MPI_Comm_rank(comm, &rank));
+    if (rank == 0) {
+        /* Open the original file for reading */
+        source_file = fopen(source_filename, "rb");
+        PetscCheck(source_file, PETSC_COMM_SELF, PETSC_ERR_FILE_OPEN, "Could not open source file to read: %s", source_filename);
+        
+        /* Skip the PETSc header */
+        PetscCheck(fseek(source_file, offset, SEEK_SET) == 0, PETSC_COMM_SELF, PETSC_ERR_FILE_UNEXPECTED, "Error seeking in source file");
+
+        /* Open the new temporary file for writing */
+        target_file = fopen(target_filename, "wb");
+        PetscCheck(target_file, PETSC_COMM_SELF, PETSC_ERR_FILE_OPEN, "Could not open temporary file to write: %s", target_filename);
+
+        /* Copy the rest of the source file to the target file */
+        while ((bytes_read = fread(buffer, 1, sizeof(buffer), source_file)) > 0) {
+            fwrite(buffer, 1, bytes_read, target_file);
+        }
+        fclose(source_file);
+        fclose(target_file);
+    }
+    PetscCallMPI(MPI_Barrier(comm));
+    PetscFunctionReturn(PETSC_SUCCESS);
+}
+
 #define DMLoad_pforest _append_pforest(DMLoad)
 static PetscErrorCode DMLoad_pforest(DM dm, PetscViewer viewer)
 {
@@ -4886,8 +4954,11 @@ static PetscErrorCode DMLoad_pforest(DM dm, PetscViewer viewer)
   DM_Forest_pforest   *pforest = (DM_Forest_pforest *)forest->data;
   PetscBool           isbinary;
   PetscViewerFormat   format;
+
   const char          *filename;
-  char                conn_filename[PETSC_MAX_PATH_LEN];
+  char                temp_filename[PETSC_MAX_PATH_LEN];
+  const long          header_size = sizeof(PetscInt) + 256; // sizeof(classid) + sizeof(type) -> DMView
+
   MPI_Comm            comm = PetscObjectComm((PetscObject)dm);
 
   PetscFunctionBegin;
@@ -4895,7 +4966,7 @@ static PetscErrorCode DMLoad_pforest(DM dm, PetscViewer viewer)
   PetscCall(PetscObjectTypeCompare((PetscObject)viewer, PETSCVIEWERBINARY, &isbinary));
   PetscCheck(isbinary, comm, PETSC_ERR_ARG_WRONG, "Must use PETSCVIEWERBINARY to load DMForest");
   
-  // Check the viewer type -> should be PETSC_VIEWER_BINARY_P4EST
+  // Check the viewer format type -> should be PETSC_VIEWER_BINARY_P4EST
   PetscCall(PetscViewerGetFormat(viewer, &format));
   PetscCheck(format == PETSC_VIEWER_BINARY_P4EST, comm, PETSC_ERR_ARG_WRONG, "The input file is not in the p4est native format. Use the viewer option '-dm_load_format binary_p4est'.");
 
@@ -4923,38 +4994,55 @@ static PetscErrorCode DMLoad_pforest(DM dm, PetscViewer viewer)
   // Mark dm as not finished
   dm->setupcalled = PETSC_FALSE; // signal that dm is not finished
 
-  PetscCall(PetscPrintf(PETSC_COMM_WORLD, "BANANA\n"));
-  // Get the file Paths for loading
-  PetscCall(PetscViewerFileGetName(viewer, &filename));
+  // [MAIN ROUTE] - Get the file Paths for loading - MAIN ROUTE
+  // PetscCall(PetscViewerFileGetName(viewer, &filename));
 
-  // Load connectivity from <filename>.conn and build DMFTopology_pforest
-  PetscCall(PetscSNPrintf(conn_filename, sizeof(conn_filename), "%s.conn", filename));
-  {
-    PetscBool is_valid;
+  // [WORKAROUND] - Create a temporary file containing ONLY the p4est data */
+  PetscCall(PetscViewerFileGetName(viewer, &filename));
+  PetscCall(PetscSNPrintf(temp_filename, sizeof(temp_filename), "%s.p4est_tmp", filename));
+  PetscCall(CreateFileWithoutHeader(temp_filename, filename, header_size, comm));
+  filename = temp_filename;
+  //--------------------------------------------------------------------------
+
+  { // Loading p4est and connectivity from .p4est file and populating DMFTopology_pforest
     DMFTopology_pforest *topo;
+    PetscBool           is_valid;
+    
+    // Initialize components of topology
     PetscCall(PetscNew(&topo));
     topo->refct = 1;
-    PetscCallP4estReturn(topo->conn, p4est_connectivity_load, (conn_filename, NULL));
-    PetscCallP4estReturn(is_valid, p4est_connectivity_is_valid, (topo->conn));
-    PetscCheck(is_valid, comm, PETSC_ERR_LIB, "The loaded p4est connectivity is not valid!");
-    PetscCallP4estReturn(topo->geom, p4est_geometry_new_connectivity, (topo->conn));
-    PetscCall(PforestConnectivityEnumerateFacets(topo->conn, &topo->tree_face_to_uniq));
+    topo->geom  = NULL;
+    topo->conn  = NULL;
     pforest->topo = topo;
-  }
-  PetscCall(PetscPrintf(PETSC_COMM_WORLD, "KIWI\n"));
-  // Load the forest object
-  // * data_size = 0 (no user data to load)
-  // * autopartition = 1 -> re-partition the mesh for the current number of MPI ranks
-  {
-    PetscBool is_valid;
+
+    // Load all information from .p4est file
     PetscCallP4estReturn(pforest->forest, p4est_load_ext, (filename, comm, 0, 0, 1, 1, (void *)dm, &(pforest->topo->conn)));
+  
+    // check wheather the loaded structures were loaded
+    PetscCheck(pforest->forest && pforest->topo->conn, comm, PETSC_ERR_FILE_OPEN, "Could not load p4est forest or connectivity from file");
+
+    // Populate p4est_geometry_t in DMFTopology_pforest
+    PetscCallP4estReturn(pforest->topo->geom, p4est_geometry_new_connectivity, (pforest->topo->conn));
+    
+    // Calculate tree_face_to_uniq in DMFTopology_pforest
+    PetscCall(PforestConnectivityEnumerateFacets(pforest->topo->conn, &pforest->topo->tree_face_to_uniq));
+
+    // Create the label _forest_base_subpoint_map, so that it gets populated
+    PetscInt minRefinement;
+    PetscCall(DMForestGetMinimumRefinement(dm, &minRefinement));
+    if (!minRefinement) {
+      PetscCall(PetscPrintf(comm, "Creating internal label '_forest_base_subpoint_map'.\n"));
+      PetscCall(DMCreateLabel(dm, "_forest_base_subpoint_map"));
+    }
+
+    // check if the final structures are valid under P4EST
     PetscCallP4estReturn(is_valid, p4est_is_valid, (pforest->forest));
     PetscCheck(is_valid, comm, PETSC_ERR_LIB, "The loaded p4est forest is not valid!");
-    pforest->forest->user_pointer = (void *)dm;
+    PetscCallP4estReturn(is_valid, p4est_connectivity_is_valid, (topo->conn));
+    PetscCheck(is_valid, comm, PETSC_ERR_LIB, "The loaded p4est connectivity is not valid!");
   }
 
-  // Re-create ghost layers based on the DM's overlap setting
-  {
+  { // Populating p4est_ghost_t (ghost layers) based on the DM's overlap setting
     PetscInt    overlap;
     PetscMPIInt size;
 
@@ -4973,6 +5061,13 @@ static PetscErrorCode DMLoad_pforest(DM dm, PetscViewer viewer)
   dm->setupcalled = PETSC_TRUE;
 
   PetscCall(DMPforestGetPlex(dm, NULL));
+
+  /* Clean up the temporary file */
+  PetscMPIInt rank;
+  PetscCallMPI(MPI_Comm_rank(comm, &rank));
+  if (rank == 0) {
+    remove(filename);
+  }
 
   PetscFunctionReturn(PETSC_SUCCESS);
 }
@@ -5282,6 +5377,7 @@ static PetscErrorCode DMInitialize_pforest(DM dm)
   PetscFunctionBegin;
   dm->ops->setup                     = DMSetUp_pforest;
   dm->ops->view                      = DMView_pforest;
+  dm->ops->load                      = DMLoad_pforest;
   dm->ops->clone                     = DMClone_pforest;
   dm->ops->createinterpolation       = DMCreateInterpolation_pforest;
   dm->ops->createinjection           = DMCreateInjection_pforest;
